@@ -145,7 +145,7 @@ def find_devices():
     parser = argparse.ArgumentParser()
     parser.add_argument('-d', '--device', dest='type')
 
-    devices = smart_ctl('--scan-open')
+    devices = smart_ctl('-d', 'by-id', '--scan-open')
 
     for device in devices.split('\n'):
         device = device.strip()
