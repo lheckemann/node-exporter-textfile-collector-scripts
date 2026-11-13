@@ -1,4 +1,5 @@
-#!/bin/bash
+#!/usr/bin/env bash
+#
 # Script informed by the collectd monitoring script for smartmontools (using smartctl)
 # by Samuel B. <samuel_._behan_(at)_dob_._sk> (c) 2012
 # source at: http://devel.dob.sk/collectd-scripts/
@@ -9,6 +10,9 @@
 
 # Formatting done via shfmt -i 2
 # https://github.com/mvdan/sh
+
+# Ensure predictable numeric / date formats, etc.
+export LC_ALL=C
 
 parse_smartctl_attributes_awk="$(
   cat <<'SMARTCTLAWK'
@@ -31,6 +35,9 @@ end_to_end_error
 erase_fail_count
 g_sense_error_rate
 hardware_ecc_recovered
+helium_condition_lower
+helium_condition_upper
+helium_level
 host_reads_32mib
 host_reads_mib
 host_writes_32mib
@@ -39,6 +46,7 @@ load_cycle_count
 media_wearout_indicator
 nand_writes_1gib
 offline_uncorrectable
+percent_lifetime_remain
 power_cycle_count
 power_on_hours
 program_fail_cnt_total
@@ -98,13 +106,14 @@ parse_smartctl_scsi_attributes() {
   [ -n "$power_on" ] && echo "power_on_hours_raw_value{${labels},smart_id=\"9\"} ${power_on}"
   [ -n "$temp_cel" ] && echo "temperature_celsius_raw_value{${labels},smart_id=\"194\"} ${temp_cel}"
   [ -n "$lbas_read" ] && echo "total_lbas_read_raw_value{${labels},smart_id=\"242\"} ${lbas_read}"
-  [ -n "$lbas_written" ] && echo "total_lbas_written_raw_value{${labels},smart_id=\"242\"} ${lbas_written}"
+  [ -n "$lbas_written" ] && echo "total_lbas_written_raw_value{${labels},smart_id=\"241\"} ${lbas_written}"
   [ -n "$power_cycle" ] && echo "power_cycle_count_raw_value{${labels},smart_id=\"12\"} ${power_cycle}"
-  [ -n "$grown_defects" ] && echo "grown_defects_count_raw_value{${labels},smart_id=\"12\"} ${grown_defects}"
+  [ -n "$grown_defects" ] && echo "grown_defects_count_raw_value{${labels},smart_id=\"-1\"} ${grown_defects}"
 }
 
 parse_smartctl_info() {
-  local -i smart_available=0 smart_enabled=0 smart_healthy=
+  local -i smart_available=0 smart_enabled=0
+  local smart_healthy=''
   local disk="$1" disk_type="$2"
   local model_family='' device_model='' serial_number='' fw_version='' vendor='' product='' revision='' lun_id=''
   while read -r line; do
@@ -113,7 +122,7 @@ parse_smartctl_info() {
     case "${info_type}" in
     Model_Family) model_family="${info_value}" ;;
     Device_Model) device_model="${info_value}" ;;
-    Serial_Number) serial_number="${info_value}" ;;
+    Serial_Number|Serial_number) serial_number="${info_value}" ;;
     Firmware_Version) fw_version="${info_value}" ;;
     Vendor) vendor="${info_value}" ;;
     Product) product="${info_value}" ;;
@@ -139,6 +148,12 @@ parse_smartctl_info() {
       esac
     fi
   done
+  # NVMe always supports SMART/Health Information (mandatory per NVMe spec, Log Identifier 02h).
+  # Unlike SATA, NVMe devices do not output "SMART support is:" lines from smartctl.
+  if [[ "${disk_type}" == "nvme" ]]; then
+    smart_available=1
+    smart_enabled=1
+  fi
   echo "device_info{disk=\"${disk}\",type=\"${disk_type}\",vendor=\"${vendor}\",product=\"${product}\",revision=\"${revision}\",lun_id=\"${lun_id}\",model_family=\"${model_family}\",device_model=\"${device_model}\",serial_number=\"${serial_number}\",firmware_version=\"${fw_version}\"} 1"
   echo "device_smart_available{disk=\"${disk}\",type=\"${disk_type}\"} ${smart_available}"
   echo "device_smart_enabled{disk=\"${disk}\",type=\"${disk_type}\"} ${smart_enabled}"
@@ -162,15 +177,16 @@ format_output() {
     awk -F'{' "${output_format_awk}"
 }
 
-smartctl_version="$(/usr/sbin/smartctl -V | head -n1 | awk '$1 == "smartctl" {print $2}')"
+smartctl_version="$(smartctl -V | awk 'NR==1 && $1 == "smartctl" {print $2}')"
 
 echo "smartctl_version{version=\"${smartctl_version}\"} 1" | format_output
 
-if [[ "$(expr "${smartctl_version}" : '\([0-9]*\)\..*')" -lt 6 ]]; then
-  exit
+# Exit if "smartctl" version is lower 6
+if [[ ${smartctl_version%.*} -lt 6 ]]; then
+  exit 0
 fi
 
-device_list="$(/usr/sbin/smartctl --scan-open | awk '/^\/dev/{print $1 "|" $3}')"
+device_list="$(smartctl --scan-open | awk '/^\/dev/{print $1 "|" $3}')"
 
 for device in ${device_list}; do
   disk="$(echo "${device}" | cut -f1 -d'|')"
@@ -178,22 +194,23 @@ for device in ${device_list}; do
   active=1
   echo "smartctl_run{disk=\"${disk}\",type=\"${type}\"}" "$(TZ=UTC date '+%s')"
   # Check if the device is in a low-power mode
-  /usr/sbin/smartctl -n standby -d "${type}" "${disk}" > /dev/null || active=0
+  smartctl -n standby -d "${type}" "${disk}" > /dev/null || active=0
   echo "device_active{disk=\"${disk}\",type=\"${type}\"}" "${active}"
   # Skip further metrics to prevent the disk from spinning up
   test ${active} -eq 0 && continue
   # Get the SMART information and health
-  /usr/sbin/smartctl -i -H -d "${type}" "${disk}" | parse_smartctl_info "${disk}" "${type}"
+  smartctl -i -H -d "${type}" "${disk}" | parse_smartctl_info "${disk}" "${type}"
   # Get the SMART attributes
   case ${type} in
-  sat) /usr/sbin/smartctl -A -d "${type}" "${disk}" | parse_smartctl_attributes "${disk}" "${type}" ;;
-  sat+megaraid*) /usr/sbin/smartctl -A -d "${type}" "${disk}" | parse_smartctl_attributes "${disk}" "${type}" ;;
-  scsi) /usr/sbin/smartctl -A -d "${type}" "${disk}" | parse_smartctl_scsi_attributes "${disk}" "${type}" ;;
-  megaraid*) /usr/sbin/smartctl -A -d "${type}" "${disk}" | parse_smartctl_scsi_attributes "${disk}" "${type}" ;;
-  nvme*) /usr/sbin/smartctl -A -d "${type}" "${disk}" | parse_smartctl_scsi_attributes "${disk}" "${type}" ;;
+  sat) smartctl -A -d "${type}" "${disk}" | parse_smartctl_attributes "${disk}" "${type}" ;;
+  sat+megaraid*) smartctl -A -d "${type}" "${disk}" | parse_smartctl_attributes "${disk}" "${type}" ;;
+  scsi) smartctl -A -d "${type}" "${disk}" | parse_smartctl_scsi_attributes "${disk}" "${type}" ;;
+  megaraid*) smartctl -A -d "${type}" "${disk}" | parse_smartctl_scsi_attributes "${disk}" "${type}" ;;
+  nvme*) smartctl -A -d "${type}" "${disk}" | parse_smartctl_scsi_attributes "${disk}" "${type}" ;;
+  usbprolific) smartctl -A -d "${type}" "${disk}" | parse_smartctl_attributes "${disk}" "${type}" ;;
   *)
       (>&2 echo "disk type is not sat, scsi, nvme or megaraid but ${type}")
-    exit
+    continue
     ;;
   esac
 done | format_output

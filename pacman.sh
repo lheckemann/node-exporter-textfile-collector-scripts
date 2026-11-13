@@ -1,5 +1,4 @@
-#!/bin/bash
-#
+#!/usr/bin/env bash
 #
 # Description: Expose metrics from pacman updates
 # If installed The bash script *checkupdates*, included with the
@@ -14,7 +13,10 @@ set -o pipefail
 
 if [ -x /usr/bin/checkupdates ]
 then
-    updates=$(/usr/bin/checkupdates | wc -l)
+    if ! updates=$(/usr/bin/checkupdates | wc -l)
+    then
+        updates=0
+    fi
     cache=0
 else
     if ! updates=$(/usr/bin/pacman -Qu | wc -l)
